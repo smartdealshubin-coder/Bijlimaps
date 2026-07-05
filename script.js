@@ -1,10 +1,12 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-app.js";
-import { getFirestore, collection, addDoc, query, where, orderBy, limit, getDocs } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-firestore.js";
+import { getFirestore, collection, addDoc, query, where, orderBy, limit, onSnapshot, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.8.1/firebase-firestore.js";
 
 const BijliMapApp = (function() {
     'use strict';
 
-    // 1. Core Configuration (Preserving Firebase)
+    // ==========================================
+    // 1. CONFIGURATION (Preserved Firebase)
+    // ==========================================
     const CONFIG = {
         firebase: {
             apiKey: "AIzaSyCKU2XkjjsCthNqIFWBFt_fi6bSpgVY1OM",
@@ -16,20 +18,22 @@ const BijliMapApp = (function() {
             measurementId: "G-X8YRS24558"
         },
         api: { nominatimUrl: 'https://nominatim.openstreetmap.org' },
-        map: { defaultCenter: [20.5937, 78.9629], defaultZoom: 5, detailZoom: 14 }
+        map: { defaultCenter: [20.5937, 78.9629], defaultZoom: 5, detailZoom: 15 }
     };
 
     const app = initializeApp(CONFIG.firebase);
     const db = getFirestore(app);
 
-    // 2. Utility & Performance Services
+    // ==========================================
+    // 2. UTILITY & UI SERVICES
+    // ==========================================
     const Utils = {
         debounce: (func, wait) => {
             let timeout;
             return (...args) => { clearTimeout(timeout); timeout = setTimeout(() => func(...args), wait); };
         },
         timeAgo: (dateString) => {
-            if (!dateString) return "Unknown";
+            if (!dateString) return "Just now";
             const seconds = Math.floor((new Date() - new Date(dateString)) / 1000);
             if (seconds < 60) return "Just now";
             const minutes = Math.floor(seconds / 60);
@@ -39,291 +43,370 @@ const BijliMapApp = (function() {
             return new Date(dateString).toLocaleDateString();
         },
         getStatusColor: (status) => {
-            const map = { 'Available': 'var(--c-green)', 'Power Outage': 'var(--c-red)', 'Voltage Issue': 'var(--c-orange)', 'Maintenance': 'var(--c-blue)' };
-            return map[status] || 'var(--c-gray)';
+            const colors = { 'Available': 'var(--c-green)', 'Power Outage': 'var(--c-red)', 'Voltage Issue': 'var(--c-orange)', 'Maintenance': 'var(--c-blue)' };
+            return colors[status] || 'var(--c-neutral)';
         },
-        getStatusClass: (status) => {
-            const map = { 'Available': 'status-available', 'Power Outage': 'status-outage', 'Voltage Issue': 'status-voltage', 'Maintenance': 'status-maintenance' };
-            return map[status] || 'status-unknown';
+        getBadgeClass: (status) => {
+            const classes = { 'Available': 'badge-green', 'Power Outage': 'badge-red', 'Voltage Issue': 'badge-orange', 'Maintenance': 'badge-blue' };
+            return classes[status] || 'badge-neutral';
         }
     };
 
-    // Educational Loading Messages
-    class LoadingController {
-        constructor() {
-            this.el = document.getElementById('map-overlay-loader');
-            this.textEl = document.getElementById('rotating-loading-text');
-            this.messages = [
-                "Fetching latest community reports...",
-                "India's power grid serves millions every day.",
-                "Community reports improve accuracy.",
-                "Connecting to grid data..."
-            ];
-            this.interval = null;
+    class NotificationService {
+        constructor() { this.container = document.getElementById('toast-container'); }
+        show(message, type = 'info', duration = 4000) {
+            const toast = document.createElement('div');
+            toast.className = `toast toast-${type}`;
+            const icon = type === 'success' ? '✅' : type === 'error' ? '⚠️' : '💡';
+            toast.innerHTML = `<span style="font-size: 1.2rem;">${icon}</span><div class="font-semibold text-sm">${this.escapeHTML(message)}</div>`;
+            this.container.appendChild(toast);
+            setTimeout(() => { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 300); }, duration);
         }
-        show() {
-            this.el.classList.remove('hidden');
-            let i = 0;
-            this.textEl.textContent = this.messages[0];
-            this.interval = setInterval(() => {
-                i = (i + 1) % this.messages.length;
-                this.textEl.textContent = this.messages[i];
-            }, 2000);
-        }
-        hide() {
-            this.el.classList.add('hidden');
-            clearInterval(this.interval);
-        }
+        escapeHTML(str) { const div = document.createElement('div'); div.textContent = str; return div.innerHTML; }
     }
-    const Loader = new LoadingController();
+    const Notify = new NotificationService();
 
-    // 3. Bottom Sheet Controller (Mobile UX)
-    class BottomSheet {
-        constructor() {
-            this.sheet = document.getElementById('bottom-sheet');
-            this.handle = document.getElementById('drag-handle');
-            this.isDragging = false;
-            this.startY = 0;
-            this.currentY = 0;
-            
-            // Heights
-            this.peekHeight = 120; // shows search bar and title
-            this.fullHeight = window.innerHeight * 0.85;
-            
-            // State: 0 = peek, 1 = full
-            this.state = 0; 
-            
-            if (window.innerWidth < 900) this.initMobile();
-            window.addEventListener('resize', Utils.debounce(() => this.handleResize(), 200));
-        }
+    // ==========================================
+    // 3. OFFLINE SYNC & DATABASE (REALTIME)
+    // ==========================================
+    class DatabaseService {
+        constructor() { this.unsubscribe = null; }
 
-        initMobile() {
-            this.setY(window.innerHeight - this.peekHeight);
+        async saveReport(locName, lat, lon, status, reporter) {
+            const reportData = { locationName: locName, lat, lon, status, reporterName: reporter, timestamp: new Date().toISOString() };
             
-            this.handle.addEventListener('touchstart', (e) => this.dragStart(e), {passive: true});
-            window.addEventListener('touchmove', (e) => this.drag(e), {passive: false});
-            window.addEventListener('touchend', () => this.dragEnd());
-        }
+            if (!navigator.onLine) {
+                const queue = JSON.parse(localStorage.getItem('offlineReports') || '[]');
+                queue.push(reportData);
+                localStorage.setItem('offlineReports', JSON.stringify(queue));
+                Notify.show('Offline: Report queued securely.', 'info');
+                return;
+            }
 
-        handleResize() {
-            if (window.innerWidth >= 900) {
-                this.sheet.style.transform = 'none';
-            } else {
-                this.fullHeight = window.innerHeight * 0.85;
-                this.snapTo(this.state);
+            try {
+                await addDoc(collection(db, "reports"), { ...reportData, serverTime: serverTimestamp() });
+                Notify.show('Report broadcasted to grid.', 'success');
+            } catch (e) {
+                console.error(e);
+                Notify.show('Failed to save report.', 'error');
             }
         }
 
-        dragStart(e) {
-            this.isDragging = true;
-            this.startY = e.touches[0].clientY - this.currentY;
-            this.sheet.style.transition = 'none';
-        }
-
-        drag(e) {
-            if (!this.isDragging) return;
-            // Prevent scrolling underlying page
-            if (e.cancelable) e.preventDefault(); 
-            this.currentY = e.touches[0].clientY - this.startY;
-            // Clamp
-            const minY = window.innerHeight - this.fullHeight;
-            const maxY = window.innerHeight - this.peekHeight;
-            this.currentY = Math.max(minY, Math.min(this.currentY, maxY));
-            this.sheet.style.transform = `translateY(${this.currentY}px)`;
-        }
-
-        dragEnd() {
-            if (!this.isDragging) return;
-            this.isDragging = false;
-            this.sheet.style.transition = 'transform var(--transition-smooth)';
+        async syncOfflineReports() {
+            const queue = JSON.parse(localStorage.getItem('offlineReports') || '[]');
+            if (queue.length === 0) return;
             
-            const threshold = window.innerHeight - (this.fullHeight / 2);
-            if (this.currentY < threshold) this.snapTo(1);
-            else this.snapTo(0);
+            Notify.show(`Syncing ${queue.length} offline reports...`, 'info');
+            for (let report of queue) {
+                try {
+                    await addDoc(collection(db, "reports"), report);
+                } catch (e) { console.error("Sync failed for", report); }
+            }
+            localStorage.removeItem('offlineReports');
+            Notify.show('Offline reports synced successfully.', 'success');
         }
 
-        snapTo(state) {
-            this.state = state;
-            const y = state === 1 ? (window.innerHeight - this.fullHeight) : (window.innerHeight - this.peekHeight);
-            this.currentY = y;
-            this.sheet.style.transform = `translateY(${y}px)`;
+        // Phase 7 Realtime Listener
+        subscribeToLocation(locName, callback) {
+            if (this.unsubscribe) this.unsubscribe(); // Cleanup previous listener
+            
+            const q = query(collection(db, "reports"), where("locationName", "==", locName), orderBy("timestamp", "desc"), limit(20));
+            this.unsubscribe = onSnapshot(q, (snapshot) => {
+                const reports = [];
+                snapshot.forEach(doc => reports.push(doc.data()));
+                callback(reports);
+            }, (error) => {
+                console.error("Realtime listen failed:", error);
+                Notify.show('Connection to live grid lost.', 'error');
+            });
         }
-        
-        expand() { if(window.innerWidth < 900) this.snapTo(1); }
-        collapse() { if(window.innerWidth < 900) this.snapTo(0); }
     }
+    const DB = new DatabaseService();
 
-    // 4. Map Service
+    // ==========================================
+    // 4. MAP & LOCATION SYSTEM
+    // ==========================================
     class MapService {
         constructor() {
             this.map = L.map('map-view', { zoomControl: false }).setView(CONFIG.map.defaultCenter, CONFIG.map.defaultZoom);
             L.control.zoom({ position: window.innerWidth > 900 ? 'bottomright' : 'topright' }).addTo(this.map);
             L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(this.map);
-            this.marker = null;
+            
+            this.statusMarker = null;
+            this.userMarkerGroup = L.layerGroup().addTo(this.map);
         }
 
-        setMarker(lat, lon, status) {
-            if (this.marker) this.map.removeLayer(this.marker);
-            const statusClass = Utils.getStatusClass(status);
+        setStatusMarker(lat, lon, status) {
+            if (this.statusMarker) this.map.removeLayer(this.statusMarker);
             
-            const icon = L.divIcon({ 
-                className: `custom-marker ${statusClass}`, 
-                html: '<div class="marker-ring"></div><div class="marker-pin"></div>', 
-                iconSize: [20, 20], iconAnchor: [10, 10] 
-            });
+            const iconHTML = `<div class="marker-wrapper status-${status.replace(' ', '')}"><div class="marker-core"></div></div>`;
+            const icon = L.divIcon({ className: 'custom-leaflet-marker', html: iconHTML, iconSize: [30, 30], iconAnchor: [15, 15] });
             
-            this.marker = L.marker([lat, lon], { icon }).addTo(this.map);
+            this.statusMarker = L.marker([lat, lon], { icon }).addTo(this.map);
             this.map.flyTo([lat, lon], CONFIG.map.detailZoom, { animate: true, duration: 1.5 });
         }
-    }
 
-    // 5. Database Service (Optimized for Timeline)
-    class DatabaseService {
-        static async saveReport(locName, lat, lon, status, reporter) {
-            await addDoc(collection(db, "reports"), { locationName: locName, lat, lon, status, reporterName: reporter, timestamp: new Date().toISOString() });
-        }
-
-        static async getLocationHistory(locName) {
-            // Optimized query: limit to 5 recent reports for timeline
-            const q = query(collection(db, "reports"), where("locationName", "==", locName), orderBy("timestamp", "desc"), limit(5));
-            const snapshot = await getDocs(q);
-            let reports = [];
-            snapshot.forEach(doc => reports.push(doc.data()));
-            return reports;
+        updateUserLocation(lat, lon, accuracy) {
+            this.userMarkerGroup.clearLayers();
+            
+            // Accuracy Circle
+            L.circle([lat, lon], { radius: accuracy, color: '#2563eb', fillColor: '#2563eb', fillOpacity: 0.1, weight: 1 }).addTo(this.userMarkerGroup);
+            
+            // Blue Dot
+            const icon = L.divIcon({ className: 'user-dot-container', html: '<div class="user-accuracy-ring"></div><div class="user-dot"></div>', iconSize: [24, 24], iconAnchor: [12, 12] });
+            L.marker([lat, lon], { icon, zIndexOffset: 1000 }).addTo(this.userMarkerGroup);
+            
+            this.map.flyTo([lat, lon], CONFIG.map.detailZoom, { animate: true, duration: 1.2 });
         }
     }
 
-    // 6. Main Controller
+    // ==========================================
+    // 5. BOTTOM SHEET (MOBILE UX)
+    // ==========================================
+    class BottomSheet {
+        constructor() {
+            this.panel = document.getElementById('main-panel');
+            this.handle = document.getElementById('drag-handle');
+            this.isMobile = window.innerWidth < 900;
+            this.state = 0; // 0 = peek, 1 = full
+            
+            if (this.isMobile) this.initMobile();
+            window.addEventListener('resize', Utils.debounce(() => {
+                this.isMobile = window.innerWidth < 900;
+                if (!this.isMobile) this.panel.style.transform = 'none';
+                else this.snapTo(this.state);
+            }, 200));
+        }
+
+        initMobile() {
+            let startY = 0, currentY = 0, isDragging = false;
+            const peekY = window.innerHeight - 200;
+            const fullY = window.innerHeight * 0.15;
+            this.snapTo(0);
+
+            this.handle.addEventListener('touchstart', e => { isDragging = true; startY = e.touches[0].clientY - currentY; this.panel.style.transition = 'none'; }, {passive: true});
+            window.addEventListener('touchmove', e => {
+                if (!isDragging) return;
+                currentY = Math.max(fullY, Math.min(e.touches[0].clientY - startY, peekY));
+                this.panel.style.transform = `translateY(${currentY}px)`;
+            }, {passive: true});
+            window.addEventListener('touchend', () => {
+                if (!isDragging) return;
+                isDragging = false;
+                this.panel.style.transition = 'transform var(--trans-smooth)';
+                this.snapTo(currentY < (window.innerHeight / 2) ? 1 : 0);
+            });
+        }
+
+        snapTo(state) {
+            this.state = state;
+            if (this.isMobile) {
+                const y = state === 1 ? window.innerHeight * 0.15 : window.innerHeight - 200;
+                this.panel.style.transform = `translateY(${y}px)`;
+            }
+        }
+    }
+
+    // ==========================================
+    // 6. MAIN APPLICATION CONTROLLER
+    // ==========================================
     class AppController {
         constructor() {
             this.Map = new MapService();
             this.Sheet = new BottomSheet();
-            this.currentLoc = null;
+            this.currentContext = { name: null, lat: null, lon: null };
+            
+            this.cacheDOM();
             this.bindEvents();
+            this.initNetworkHandling();
+            
+            // Prefill reporter name from local storage if exists (Value-driven context handling)
+            const savedName = localStorage.getItem('bijlimap_reporter_name') || 'Abhinav Singh'; 
+            document.getElementById('reporter_name').value = savedName;
+        }
+
+        cacheDOM() {
+            this.DOM = {
+                searchInput: document.getElementById('search-input'),
+                searchDropdown: document.getElementById('search-dropdown'),
+                searchResults: document.getElementById('search-results'),
+                searchLoader: document.getElementById('search-loader'),
+                
+                initialState: document.getElementById('initial-state'),
+                uiSkeleton: document.getElementById('ui-skeleton'),
+                liveStatusView: document.getElementById('live-status-view'),
+                emptyState: document.getElementById('empty-state'),
+                timelineContainer: document.getElementById('timeline-container'),
+                
+                locNameText: document.getElementById('data-location'),
+                mainBadge: document.getElementById('badge-main-status'),
+                timelineList: document.getElementById('report-timeline'),
+                reportCount: document.getElementById('data-report-count'),
+                
+                modal: document.getElementById('modal-report'),
+                modalForm: document.getElementById('form-report'),
+                modalLocName: document.getElementById('modal-loc-name'),
+                btnSubmitReport: document.getElementById('btn-submit-report')
+            };
         }
 
         bindEvents() {
-            // Navigation
-            document.querySelectorAll('[data-target]').forEach(btn => {
-                btn.addEventListener('click', (e) => {
-                    e.preventDefault();
-                    document.querySelectorAll('.view-section').forEach(v => v.classList.remove('active'));
-                    document.getElementById(`view-${btn.dataset.target}`).classList.add('active');
-                    if(btn.dataset.target === 'dashboard') setTimeout(() => this.Map.map.invalidateSize(), 300);
-                });
-            });
-
-            // Mobile menu
-            document.getElementById('mobile-menu-btn').addEventListener('click', () => {
-                document.getElementById('header-nav').classList.toggle('open');
-            });
-
-            // Search Logic (Debounced)
-            const searchInput = document.getElementById('search-input');
-            searchInput.addEventListener('focus', () => this.Sheet.expand());
-            searchInput.addEventListener('input', Utils.debounce(async (e) => {
-                const queryStr = e.target.value;
-                if(queryStr.length < 3) return document.getElementById('search-dropdown').classList.add('hidden');
+            // Search (Debounced Nominatim Request)
+            this.DOM.searchInput.addEventListener('input', Utils.debounce(async (e) => {
+                const query = e.target.value.trim();
+                if(query.length < 3) return this.DOM.searchDropdown.classList.add('hidden');
                 
-                document.getElementById('search-dropdown').classList.remove('hidden');
-                const res = await fetch(`${CONFIG.api.nominatimUrl}/search?format=json&q=${encodeURIComponent(queryStr)}&countrycodes=in&limit=4`);
-                const data = await res.json();
+                this.DOM.searchLoader.classList.remove('hidden');
+                this.DOM.searchDropdown.classList.remove('hidden');
                 
-                const resultsEl = document.getElementById('search-results');
-                resultsEl.innerHTML = '';
-                data.forEach(item => {
-                    const div = document.createElement('div');
-                    div.className = 'search-result-item';
-                    div.textContent = item.display_name.split(',')[0] + ', ' + (item.address?.state || '');
-                    div.onclick = () => {
-                        document.getElementById('search-dropdown').classList.add('hidden');
-                        searchInput.value = '';
-                        this.selectLocation(item.name || item.display_name.split(',')[0], item.lat, item.lon);
-                    };
-                    resultsEl.appendChild(div);
-                });
-            }, 400));
-
-            // GPS
-            document.getElementById('btn-gps-fab').addEventListener('click', () => {
-                if(!navigator.geolocation) return alert('GPS unsupported');
-                Loader.show();
-                navigator.geolocation.getCurrentPosition(async (pos) => {
-                    const res = await fetch(`${CONFIG.api.nominatimUrl}/reverse?format=json&lat=${pos.coords.latitude}&lon=${pos.coords.longitude}&zoom=14`);
+                try {
+                    const res = await fetch(`${CONFIG.api.nominatimUrl}/search?format=json&q=${encodeURIComponent(query)}&countrycodes=in&limit=5`);
                     const data = await res.json();
-                    this.selectLocation(data.name || "Current Location", pos.coords.latitude, pos.coords.longitude);
-                });
+                    
+                    this.DOM.searchResults.innerHTML = '';
+                    if(data.length === 0) {
+                        this.DOM.searchResults.innerHTML = '<div class="p-3 text-center text-muted">No locations found.</div>';
+                    } else {
+                        data.forEach(item => {
+                            const div = document.createElement('div');
+                            div.className = 'search-result-item';
+                            div.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16" class="text-muted"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"></path><circle cx="12" cy="10" r="3"></circle></svg> <span>${item.display_name.split(',')[0]}, ${item.address?.state || ''}</span>`;
+                            div.onclick = () => {
+                                this.DOM.searchDropdown.classList.add('hidden');
+                                this.DOM.searchInput.value = '';
+                                this.loadLocationData(item.name || item.display_name.split(',')[0], parseFloat(item.lat), parseFloat(item.lon));
+                            };
+                            this.DOM.searchResults.appendChild(div);
+                        });
+                    }
+                } catch(err) { console.error("Search failed"); }
+                this.DOM.searchLoader.classList.add('hidden');
+            }, 500));
+
+            // Close search on outside click
+            document.addEventListener('click', (e) => { if (!e.target.closest('.search-module')) this.DOM.searchDropdown.classList.add('hidden'); });
+
+            // GPS Location
+            document.getElementById('btn-gps-fab').addEventListener('click', () => {
+                if (!navigator.geolocation) return Notify.show('GPS not supported by device.', 'error');
+                
+                Notify.show('Acquiring high-accuracy satellite lock...', 'info');
+                navigator.geolocation.getCurrentPosition(
+                    async (pos) => {
+                        const { latitude, longitude, accuracy } = pos.coords;
+                        this.Map.updateUserLocation(latitude, longitude, accuracy);
+                        
+                        // Reverse geocode to get area name
+                        try {
+                            const res = await fetch(`${CONFIG.api.nominatimUrl}/reverse?format=json&lat=${latitude}&lon=${longitude}&zoom=14`);
+                            const data = await res.json();
+                            const locName = data.name || data.address?.city || data.address?.village || "Current Location";
+                            this.loadLocationData(locName, latitude, longitude);
+                        } catch(e) { Notify.show('Failed to resolve area name.', 'error'); }
+                    },
+                    (err) => {
+                        if (err.code === 1) Notify.show('Location access denied. Please enable permissions.', 'error');
+                        else Notify.show('GPS signal lost. Try searching manually.', 'error');
+                    },
+                    { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+                );
             });
 
-            // Modals
-            const modal = document.getElementById('modal-report');
+            // Report Modal Logic
             document.getElementById('btn-report-fab').addEventListener('click', () => {
-                if(!this.currentLoc) return alert('Search a location first.');
-                document.getElementById('form-report').reset();
-                modal.showModal();
+                if (!this.currentContext.name) return Notify.show('Please search or select a location first.', 'error');
+                this.DOM.modalLocName.textContent = this.currentContext.name;
+                this.DOM.modal.showModal();
             });
-            document.querySelectorAll('[data-action="close-modal"]').forEach(b => b.onclick = () => modal.close());
-            
-            document.getElementById('form-report').addEventListener('submit', async (e) => {
+
+            document.querySelectorAll('[data-action="close-modal"]').forEach(btn => btn.onclick = () => this.DOM.modal.close());
+
+            this.DOM.modalForm.addEventListener('submit', async (e) => {
                 e.preventDefault();
-                const fd = new FormData(e.target);
-                await DatabaseService.saveReport(this.currentLoc.name, this.currentLoc.lat, this.currentLoc.lon, fd.get('power_status'), fd.get('reporter_name'));
-                modal.close();
-                this.selectLocation(this.currentLoc.name, this.currentLoc.lat, this.currentLoc.lon); // Refresh
+                const btn = this.DOM.btnSubmitReport;
+                btn.disabled = true; btn.textContent = 'Authenticating...';
+                
+                const formData = new FormData(this.DOM.modalForm);
+                const status = formData.get('power_status');
+                const reporter = formData.get('reporter_name');
+                
+                // Save name for future convenience
+                localStorage.setItem('bijlimap_reporter_name', reporter);
+                
+                await DB.saveReport(this.currentContext.name, this.currentContext.lat, this.currentContext.lon, status, reporter);
+                
+                this.DOM.modal.close();
+                btn.disabled = false; btn.textContent = 'Submit Update';
             });
         }
 
-        async selectLocation(name, lat, lon) {
-            this.currentLoc = { name, lat, lon };
-            document.getElementById('data-location').textContent = name;
-            document.getElementById('modal-loc-name').textContent = name;
-            
-            this.Sheet.collapse(); // UX: Map focus
-            Loader.show();
-
-            const reports = await DatabaseService.getLocationHistory(name);
-            Loader.hide();
-
-            const emptyState = document.getElementById('empty-state');
-            const timelineContainer = document.getElementById('timeline-container');
-            const timeline = document.getElementById('report-timeline');
-            const mainBadge = document.getElementById('badge-main-status');
-
-            if(reports.length === 0) {
-                emptyState.classList.remove('hidden');
-                timelineContainer.classList.add('hidden');
-                mainBadge.textContent = 'Unknown';
-                mainBadge.className = 'status-badge badge-neutral';
-                this.Map.setMarker(lat, lon, 'Unknown');
-                return;
-            }
-
-            emptyState.classList.add('hidden');
-            timelineContainer.classList.remove('hidden');
-            timeline.innerHTML = '';
-            
-            // Build Timeline
-            reports.forEach((r, idx) => {
-                const li = document.createElement('li');
-                li.className = 'timeline-item';
-                li.innerHTML = `
-                    <div class="timeline-dot" style="background-color: ${Utils.getStatusColor(r.status)}"></div>
-                    <div class="timeline-content">
-                        <span class="tl-status" style="color: ${Utils.getStatusColor(r.status)}">${r.status}</span>
-                        <span class="tl-meta">${Utils.timeAgo(r.timestamp)} by ${r.reporterName}</span>
-                    </div>
-                `;
-                timeline.appendChild(li);
+        initNetworkHandling() {
+            const banner = document.getElementById('offline-banner');
+            window.addEventListener('offline', () => banner.classList.remove('hidden'));
+            window.addEventListener('online', () => {
+                banner.classList.add('hidden');
+                DB.syncOfflineReports();
             });
+            if (!navigator.onLine) banner.classList.remove('hidden');
+        }
 
-            // Update main status
-            const latest = reports[0].status;
-            mainBadge.textContent = latest;
-            mainBadge.className = `status-badge ${latest === 'Available' ? 'badge-green' : latest === 'Power Outage' ? 'badge-red' : latest === 'Voltage Issue' ? 'badge-orange' : 'badge-blue'}`;
-            this.Map.setMarker(lat, lon, latest);
+        // ==========================================
+        // UI STATE MANAGEMENT & REALTIME RENDER
+        // ==========================================
+        loadLocationData(name, lat, lon) {
+            this.currentContext = { name, lat, lon };
+            this.Sheet.snapTo(1); // Expand sheet on mobile
+            
+            this.DOM.initialState.classList.add('hidden');
+            this.DOM.liveStatusView.classList.add('hidden');
+            this.DOM.uiSkeleton.classList.remove('hidden');
+
+            // Phase 7: Realtime Subscription updates UI instantly on change
+            DB.subscribeToLocation(name, (reports) => {
+                this.DOM.uiSkeleton.classList.add('hidden');
+                this.DOM.liveStatusView.classList.remove('hidden');
+                this.DOM.locNameText.textContent = name;
+                
+                if (reports.length === 0) {
+                    this.DOM.emptyState.classList.remove('hidden');
+                    this.DOM.timelineContainer.classList.add('hidden');
+                    this.DOM.mainBadge.textContent = 'Unknown';
+                    this.DOM.mainBadge.className = 'status-badge badge-neutral';
+                    this.Map.setStatusMarker(lat, lon, 'Unknown');
+                    return;
+                }
+
+                this.DOM.emptyState.classList.add('hidden');
+                this.DOM.timelineContainer.classList.remove('hidden');
+                
+                // Update Main Status Card (Latest Report)
+                const latest = reports[0];
+                this.DOM.mainBadge.textContent = latest.status;
+                this.DOM.mainBadge.className = `status-badge ${Utils.getBadgeClass(latest.status)}`;
+                this.DOM.reportCount.textContent = `${reports.length} Verified Update${reports.length>1?'s':''}`;
+                
+                this.Map.setStatusMarker(lat, lon, latest.status);
+
+                // Build Timeline
+                this.DOM.timelineList.innerHTML = '';
+                reports.forEach(report => {
+                    const li = document.createElement('li');
+                    li.className = 'timeline-item';
+                    li.innerHTML = `
+                        <div class="timeline-dot" style="background-color: ${Utils.getStatusColor(report.status)}"></div>
+                        <div class="tl-status" style="color: ${Utils.getStatusColor(report.status)}">${report.status}</div>
+                        <div class="tl-meta">
+                            <span class="font-semibold">${report.reporterName}</span>
+                            <span>• ${Utils.timeAgo(report.timestamp)}</span>
+                        </div>
+                    `;
+                    this.DOM.timelineList.appendChild(li);
+                });
+            });
         }
     }
 
+    // Bootstrap Application
     return { init: () => new AppController() };
 })();
 
